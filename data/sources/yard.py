@@ -64,11 +64,20 @@ def download(
     log.info("Wrote labels → %s", labels_csv)
 
     # ----- 2. Build the list of crop_path values we actually need. -----
-    wanted: list[tuple[str, str, str]] = []  # (crop_path, species, tier)
-    for line in labels_csv.read_text().splitlines()[1:]:
-        crop_path, species, tier = line.split(",", 2)
-        wanted.append((crop_path, species, tier))
-    log.info("DB returned %d labels across requested tiers", len(wanted))
+    # Use csv.reader so quoted species names (e.g. those with embedded
+    # commas) get parsed correctly. Filter out NAB and Unknown bird —
+    # they don't belong in a species classifier's training data
+    # (BirdWatcher's binary filter handles NAB suppression separately).
+    import csv as _csv
+    wanted: list[tuple[str, str, str]] = []   # (crop_path, species, tier)
+    with open(labels_csv) as f:
+        reader = _csv.DictReader(f)
+        for row in reader:
+            species = row["species"].strip()
+            if species in ("Not a bird", "Unknown bird") or not species:
+                continue
+            wanted.append((row["crop_path"], species, row["tier"]))
+    log.info("DB returned %d real-species labels across requested tiers", len(wanted))
 
     # ----- 3. Rsync only the crops we need. -----
     # Build an --files-from list to avoid pulling the full ~5GB crops/

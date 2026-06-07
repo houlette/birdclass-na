@@ -52,38 +52,51 @@ log = logging.getLogger("data.build_unified_taxonomy")
 
 OTHER_LABEL = "OTHER"
 
-# Hand-curated alias table for known variants. Mostly handles:
-#   - American/Common prefix differences (e.g. "American Robin" vs "Robin")
-#   - Spelling variants from BirdWatcher's calibration set
-#   - Family-level catch-alls the yard uses (kept as their own canonical
-#     entries; the model can predict at family granularity for ambiguous
-#     crops).
+# Hand-curated alias table for known variants. Mostly handles ornithological
+# naming differences across regions and datasets:
+#   - Older/European vernacular names used by gpiosenka vs NA names in NABirds
+#     (Rock Dove vs Rock Pigeon, Common Starling vs European Starling, etc.).
+#     These are the SAME species (same scientific binomial) under different
+#     common names; without the alias they'd end up in OTHER unfairly.
+#   - Family-level catch-alls BirdWatcher's UI uses ("Sparrow" — kept as its
+#     own canonical entry; the model can predict at family granularity for
+#     ambiguous crops).
+#
+# Keys + values are pre-normalized (post-_normalize_match). HAND_ALIASES
+# applies AFTER normalization so the source label's exact case doesn't
+# matter.
 HAND_ALIASES: dict[str, str] = {
-    # gpiosenka uses "FINCHES" plural for some classes — singular it.
+    # European/old-world common name → NA standard. Same species.
+    "Rock Dove": "Rock Pigeon",
+    "Common Starling": "European Starling",
+    "Common Pheasant": "Ring Necked Pheasant",
+    "Common Pochard": "Pochard",
+    "Common Tern": "Common Tern",  # same; included as no-op for clarity
+    # Plural / family confusion.
     "Finches": "Finch",
-    # NABirds uses "Black-capped Chickadee" but some sources just say "Chickadee".
-    # Map the family back to the canonical NABirds species.
-    "Chickadee": "Black-capped Chickadee",
 }
 
 
-def _normalize(s: str) -> str:
-    """Title-case canonical form used for matching across datasets.
+def _normalize_match(s: str) -> str:
+    """Hyphen-insensitive title-case form used to MATCH labels across
+    datasets. Stripping hyphens is the single biggest match-rate win
+    — gpiosenka uses unhyphenated forms ("DARK EYED JUNCO") while
+    NABirds uses hyphenated ("Dark-eyed Junco"); without this they
+    don't unify.
 
-    - Strips parenthetical suffixes (NABirds leaves carry morph / age
-      annotations like "Red-tailed Hawk (Light morph adult)" — we
-      collapse all morphs to species level so they map to a single
-      canonical class). gpiosenka / iNat21 / yard labels don't have
-      parentheticals, so stripping is a no-op on those.
-    - Lower-cases, removes accents/apostrophes, collapses whitespace,
-      then title-cases. ``"ABBOTT'S BABBLER"`` → ``"Abbotts Babbler"``.
+    Strips parentheticals (NABirds morph annotations), accents,
+    apostrophes, hyphens, collapses whitespace, title-cases.
     """
     s = re.sub(r"\s*\([^)]*\)", "", s)
     s = unicodedata.normalize("NFKD", s)
     s = "".join(c for c in s if not unicodedata.combining(c))
-    s = s.replace("'", "").replace("’", "")
+    s = s.replace("'", "").replace("’", "").replace("-", " ")
     s = re.sub(r"\s+", " ", s).strip().lower()
     return s.title()
+
+
+# Backwards-compat alias — older code referenced _normalize.
+_normalize = _normalize_match
 
 
 @click.command()
