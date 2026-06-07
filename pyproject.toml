@@ -1,0 +1,70 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "birdclass-na"
+version = "0.1.0-dev"
+description = "Open-source bird species classifier optimized for North American backyard / camera-trap conditions."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Ryan Houlette" }]
+keywords = ["bird", "classifier", "fine-grained", "dinov2", "computer-vision"]
+classifiers = [
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+dependencies = [
+    # Pinned to the same versions BirdWatcher's production environment uses
+    # so a fine-tuned model can drop in without dependency drift.
+    "torch>=2.5,<2.7",
+    "torchvision>=0.20,<0.22",
+    "transformers>=4.46,<4.50",
+    "huggingface_hub>=0.26,<0.30",
+    "datasets>=3.0,<4.0",
+    "timm>=1.0,<2.0",
+    "Pillow>=10.0",
+    "numpy>=1.26,<2.3",
+    "pandas>=2.2,<2.4",
+    "tqdm>=4.66",
+    "click>=8.1",                # CLI for data/, train/, eval/ scripts
+    "pydantic>=2.7",
+    "scikit-learn>=1.5",         # bootstrap CIs, classification metrics
+    "matplotlib>=3.9",           # benchmark plots
+    # Dataset-specific
+    "kaggle>=1.6",               # gpiosenka 525-species download
+    "requests>=2.32",            # NABirds + ad-hoc HTTP fetches
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.7",
+    "ipython>=8.0",
+]
+# `pip install birdclass-na[yard]` for users who want to pull labeled
+# crops from a local BirdWatcher deployment. Optional because non-yard
+# users don't need a SQLAlchemy dependency.
+yard = [
+    "sqlalchemy>=2.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/houlette/birdclass-na"
+"Bug Tracker" = "https://github.com/houlette/birdclass-na/issues"
+
+[tool.setuptools]
+packages = ["data", "train", "eval", "scripts"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+ignore = ["E501"]   # line length handled by formatter, not blocker

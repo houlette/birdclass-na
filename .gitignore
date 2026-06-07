@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+build/
+dist/
+.venv/
+venv/
+
+# Editors
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Raw datasets — large, license-bound, not part of repo content.
+# Re-acquired by `python -m data.download`.
+raw_data/
+
+# Training artifacts and intermediate features (recreatable).
+runs/
+manifests/
+features_cache/
+
+# Secrets — Kaggle/HuggingFace tokens. Pull from env at runtime.
+.env
+*.token
+
+# OS / tools
+.ipynb_checkpoints/
