@@ -6,15 +6,20 @@ on-disk layout under ``raw_data/<source>/`` and writes a per-source
 
 Implemented sources (Phase 1, next task):
 
-- ``gpiosenka``: Kaggle's 525-species set. Requires a Kaggle API token
-  at ``~/.kaggle/kaggle.json``. ~5 GB.
-- ``nabirds``: Cornell's NABirds v1. Requires manual TOS click-through
-  to obtain the download URL; the script prompts.
-- ``inat21birds``: bird subset of iNat21. Requires accepting iNat21's
-  TOS on their site; the script then extracts the Aves images from the
-  full iNat21 tarball (~250 GB) producing ~75 GB on disk.
-- ``yard``: BirdWatcher's labeled crops, rsynced from the VM, plus the
-  DB-side label dump (one CSV row per detection).
+- ``gpiosenka``: 525-species bird classification dataset. Original
+  Kaggle upload was removed by gpiosenka in 2025; we pull from the
+  HuggingFace mirror at ``yashikota/birds-525-species-image-classification``
+  which is bit-identical to the original (89,885 imgs, 525 classes).
+  No auth needed. ~2 GB.
+- ``nabirds``: Cornell's NABirds v1. Requires the user to fill the
+  request form at https://dl.allaboutbirds.org/nabirds and pass the
+  resulting personalized download URL via ``--nabirds-url``. ~3 GB.
+- ``inat21birds``: bird subset of iNat21. Pulls the official iNat21
+  train/val tarballs from the visipedia S3 bucket (no account needed),
+  extracts only the Aves category. ~75 GB after filter, ~250 GB
+  transient during the extract step.
+- ``yard``: BirdWatcher's labeled crops, rsynced from the BirdWatcher
+  VM, plus the DB-side label dump (one CSV row per detection).
 
 Each downloader is idempotent — re-running skips already-downloaded
 shards via the per-source ``state.json`` checkpoint.
