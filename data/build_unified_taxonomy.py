@@ -70,9 +70,15 @@ HAND_ALIASES: dict[str, str] = {
 def _normalize(s: str) -> str:
     """Title-case canonical form used for matching across datasets.
 
-    Lower-cases, removes accents/apostrophes, collapses whitespace, then
-    title-cases. ``"ABBOTT'S BABBLER"`` → ``"Abbotts Babbler"``.
+    - Strips parenthetical suffixes (NABirds leaves carry morph / age
+      annotations like "Red-tailed Hawk (Light morph adult)" — we
+      collapse all morphs to species level so they map to a single
+      canonical class). gpiosenka / iNat21 / yard labels don't have
+      parentheticals, so stripping is a no-op on those.
+    - Lower-cases, removes accents/apostrophes, collapses whitespace,
+      then title-cases. ``"ABBOTT'S BABBLER"`` → ``"Abbotts Babbler"``.
     """
+    s = re.sub(r"\s*\([^)]*\)", "", s)
     s = unicodedata.normalize("NFKD", s)
     s = "".join(c for c in s if not unicodedata.combining(c))
     s = s.replace("'", "").replace("’", "")

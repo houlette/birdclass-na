@@ -78,15 +78,25 @@ def download(
     crops_local = out_dir / "_crops_raw"
     crops_local.mkdir(exist_ok=True)
     log.info("rsync %d crop files …", len(wanted))
-    subprocess.run(
+    # Plain `-a`; drop --info=stats2 because macOS's bundled rsync is
+    # 2.6.9 (pre-2007) and rejects modern flags. The pip install isn't
+    # going to put a newer rsync on path either. -a is portable.
+    result = subprocess.run(
         [
-            "rsync", "-a", "--info=stats2",
+            "rsync", "-a",
             f"--files-from={listing}",
             f"{vm_host}:{vm_repo}/backend/data/",
-            str(crops_local),
+            str(crops_local) + "/",
         ],
-        check=True,
+        capture_output=True, text=True,
     )
+    if result.returncode not in (0, 23, 24):
+        # 23/24 = "vanished files" — benign during rsync; anything else
+        # is fatal.
+        log.error("rsync failed (exit %d): %s", result.returncode, result.stderr)
+        raise subprocess.CalledProcessError(
+            result.returncode, result.args, result.stdout, result.stderr,
+        )
     listing.unlink(missing_ok=True)
 
     # ----- 4. Promote rsynced crops into the canonical ImageFolder layout. -----
@@ -170,12 +180,17 @@ finally:
 """
     csv_path = out_dir / "labels.csv"
     log.info("Running label dump on VM …")
+    # Pipe the script via stdin to `python -` rather than passing as
+    # -c argument. The script contains nested single + double quotes
+    # which don't survive the ssh → remote shell → docker exec
+    # quoting sequence cleanly. stdin sidesteps the issue entirely.
     result = subprocess.run(
         [
             "ssh", vm_host,
             "docker", "compose", "-f", f"{vm_repo}/docker-compose.yml",
-            "exec", "-T", "api", "python", "-c", py_script,
+            "exec", "-T", "api", "python", "-",
         ],
+        input=py_script,
         capture_output=True, text=True, check=True,
     )
     csv_path.write_text(result.stdout)
