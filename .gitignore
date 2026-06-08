@@ -23,6 +23,9 @@ raw_data/
 runs/
 manifests/
 features_cache/
+# Built from raw_data by data/build_unified_taxonomy.py — recreatable,
+# version-locked to the dataset versions on disk, so we don't track it.
+taxonomy.json
 
 # Secrets — Kaggle/HuggingFace tokens. Pull from env at runtime.
 .env
