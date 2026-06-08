@@ -1,33 +1,34 @@
-"""Phase 3 — Full DINOv2-B fine-tune.
+"""Phase 3 — Full DINOv2-B fine-tune (single-stage, modern ViT recipe).
 
-Two-stage training:
+Earlier iteration used a two-stage general-then-domain layout; the
+domain stage on 1,617 yard samples wrecked the model (train_loss
+exploded 1.5 → 8.8 from rare-class weights blowing up gradient norm).
+This version uses the **mixed-source manifest as one training set**
+and adds the modern fine-tuning machinery that closes most of the gap
+between "naive AdamW for 2 epochs" and a well-tuned ViT fine-tune:
 
-1. **General stage**: train on the union of gpiosenka + NABirds +
-   iNat21-Birds (`general_sources`) for ``--epochs-general`` epochs.
-   This is where the model learns the broad NA taxonomy.
-2. **Domain stage**: continue training on yard data only for
-   ``--epochs-domain`` epochs. This is where the model adapts to
-   feeder-camera conditions (partial occlusion, motion blur, fence
-   clutter) that the public datasets don't have.
-
-Key implementation choices:
-
-- **Differential LR**: backbone lr=5e-5, head lr=5e-4. The fresh head
-  needs ~10× more learning than the pre-trained backbone.
-- **bf16 autocast**: A100s have native bf16 support; cuts memory ~half
-  with no quality penalty on this size of model.
-- **Resume from probe**: ``--resume-from runs/probe/`` initializes the
-  head from the linear probe's weights so we start with a working
-  classifier rather than a randomly-initialized one.
-- **Gradient accumulation**: ``--grad-accum-steps`` lets us hit
-  effective batch=64 even if real batch must be smaller for GPU RAM.
-- **HF-format save**: the best-by-val checkpoint is saved via
-  ``save_pretrained()`` so ``scripts/publish.py`` can push it directly.
+- **Linear warmup → cosine decay**: 5 % of training steps for warmup
+  prevents the first step's big gradient from wrecking the pretrained
+  backbone. Cosine decay over the remaining 95 %.
+- **Layer-wise LR decay (LLRD)**: each transformer block has its own
+  LR, decaying by `LLRD_FACTOR` per layer going down the stack. Top
+  blocks (close to the head) train near the base LR; bottom blocks
+  (close to the input embeddings) train at much lower LR so we don't
+  disturb DINOv2's well-learned low-level features.
+- **Class-weight capping**: inverse-frequency weights clamped at
+  10× so rare classes don't blow up the loss. Without this a single
+  rare-class sample dominates the batch gradient.
+- **Label smoothing 0.1**: standard for fine-grained tasks; trades
+  a sliver of training accuracy for a meaningful generalization gain.
+- **bf16 autocast** on CUDA.
+- **Best-by-val saved as HF Dinov2ForImageClassification format** so
+  the publish script can hand it directly to `upload_folder`.
 """
 from __future__ import annotations
 
 import json
 import logging
+import math
 import time
 from collections import Counter
 from pathlib import Path
@@ -41,13 +42,23 @@ from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 from tqdm import tqdm
 
-from train._common import class_weights, device, load_manifest
+from train._common import device, load_manifest
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("train.finetune")
 
 DINOV2_REPO = "facebook/dinov2-base"
 EMBED_DIM = 768
+# Per-layer LR multiplier (going from top to bottom of the encoder).
+# 0.75 is the value the original BEiT/DINOv2 fine-tuning papers report
+# works best for ViT-B; smaller (0.65) protects pretrained features
+# more aggressively but trains slower.
+LLRD_FACTOR = 0.75
+# Cap on inverse-frequency class weights — without this a single
+# 1-sample-per-class rare bird gets 50,000× the gradient weight of
+# OTHER and the batch loss is fully dominated by it.
+CLASS_WEIGHT_CAP = 10.0
+LABEL_SMOOTHING = 0.1
 
 
 class ManifestImageDataset(Dataset):
@@ -115,6 +126,82 @@ class DINOv2WithHead(nn.Module):
         return self.head(feats)
 
 
+# ---------- LR scheduling ----------------------------------------------------
+
+def _capped_class_weights(labels: list[int], n_classes: int,
+                          dev: torch.device, cap: float = CLASS_WEIGHT_CAP) -> torch.Tensor:
+    """Inverse-frequency weights, clamped so rare classes can't blow
+    up the loss. Mean of weights is kept ≈ 1 for stable LR scaling."""
+    counts = Counter(labels)
+    total = sum(counts.values())
+    weights = torch.zeros(n_classes, dtype=torch.float32, device=dev)
+    for i in range(n_classes):
+        n = counts.get(i, 1)
+        weights[i] = total / (n_classes * n)
+    weights = weights.clamp(max=cap)
+    # Re-normalize so mean ≈ 1 → loss scale doesn't drift vs uniform.
+    weights = weights / weights.mean()
+    return weights
+
+
+def _llrd_param_groups(model: DINOv2WithHead, lr_backbone: float, lr_head: float,
+                       decay: float = LLRD_FACTOR) -> list[dict]:
+    """Layer-wise LR decay for the DINOv2 backbone.
+
+    Group structure (top-of-stack → bottom-of-stack):
+      - head            → lr_head             (full)
+      - encoder.layer.{N-1, N-2, …, 0}  →  lr_backbone × decay^k
+      - embeddings      → lr_backbone × decay^N   (deepest, smallest LR)
+    """
+    groups: list[dict] = []
+    # Head: full LR.
+    groups.append({"params": list(model.head.parameters()), "lr": lr_head, "name": "head"})
+
+    # Encoder blocks: layer 11 (top) → layer 0 (bottom).
+    blocks = list(model.backbone.encoder.layer)
+    n_blocks = len(blocks)
+    # Also collect the final LayerNorm if present.
+    extra_top = []
+    if hasattr(model.backbone, "layernorm"):
+        extra_top.extend(model.backbone.layernorm.parameters())
+    if extra_top:
+        groups.append({"params": extra_top, "lr": lr_backbone,
+                       "name": "backbone_layernorm"})
+
+    for k, block in enumerate(reversed(blocks)):
+        lr = lr_backbone * (decay ** k)
+        groups.append({"params": list(block.parameters()), "lr": lr,
+                       "name": f"backbone_block_{n_blocks - 1 - k}"})
+
+    # Embeddings: deepest layer.
+    groups.append({"params": list(model.backbone.embeddings.parameters()),
+                   "lr": lr_backbone * (decay ** (n_blocks + 1)),
+                   "name": "backbone_embeddings"})
+
+    return groups
+
+
+class _WarmupCosineLR(optim.lr_scheduler._LRScheduler):
+    """Linear warmup over `warmup_steps`, then cosine decay to 0 over
+    the remaining steps."""
+
+    def __init__(self, optimizer, warmup_steps: int, total_steps: int):
+        self.warmup_steps = warmup_steps
+        self.total_steps = total_steps
+        super().__init__(optimizer)
+
+    def get_lr(self):
+        step = self.last_epoch
+        if step < self.warmup_steps:
+            scale = step / max(1, self.warmup_steps)
+        else:
+            progress = (step - self.warmup_steps) / max(1, self.total_steps - self.warmup_steps)
+            scale = 0.5 * (1 + math.cos(math.pi * min(progress, 1.0)))
+        return [base_lr * scale for base_lr in self.base_lrs]
+
+
+# ---------- Eval -------------------------------------------------------------
+
 def _evaluate(model: DINOv2WithHead, loader: DataLoader, sources: list[str], dev) -> dict:
     model.eval()
     n = 0
@@ -150,33 +237,41 @@ def _evaluate(model: DINOv2WithHead, loader: DataLoader, sources: list[str], dev
     }
 
 
+# ---------- CLI --------------------------------------------------------------
+
 @click.command()
 @click.option("--manifest", default="manifests/", type=click.Path(file_okay=False, path_type=Path))
 @click.option("--raw-data-dir", default="raw_data", type=click.Path(file_okay=False, path_type=Path))
 @click.option("--out", default="runs/finetune/", type=click.Path(file_okay=False, path_type=Path))
 @click.option("--taxonomy", default="taxonomy.json", type=click.Path(dir_okay=False, path_type=Path))
 @click.option("--resume-from", default=None, type=click.Path(file_okay=False, path_type=Path),
-              help="Path to a previous run (e.g. runs/probe/) whose head we initialize from.")
-@click.option("--epochs-general", default=2, show_default=True)
-@click.option("--epochs-domain", default=1, show_default=True)
+              help="Probe-run directory; head weights initialized from runs/probe/best_head.pt.")
+@click.option("--epochs", default=15, show_default=True,
+              help="Single-stage training over the full train manifest (gpiosenka + nabirds + "
+                   "inat21birds + yard, mixed). No separate domain stage.")
 @click.option("--batch-size", default=64, show_default=True)
-@click.option("--grad-accum-steps", default=1, show_default=True,
-              help="Virtual batch multiplier (steps before each .step()).")
-@click.option("--lr-backbone", default=5e-5, show_default=True)
-@click.option("--lr-head", default=5e-4, show_default=True)
-@click.option("--num-workers", default=4, show_default=True)
+@click.option("--grad-accum-steps", default=1, show_default=True)
+@click.option("--lr-backbone", default=2e-5, show_default=True,
+              help="Peak backbone LR. With LLRD, deeper layers train at this × decay^k.")
+@click.option("--lr-head", default=5e-4, show_default=True,
+              help="Peak head LR. Always full (no LLRD).")
+@click.option("--warmup-frac", default=0.05, show_default=True,
+              help="Fraction of total steps used as linear warmup.")
+@click.option("--weight-decay", default=0.05, show_default=True)
+@click.option("--num-workers", default=8, show_default=True)
 def main(
     manifest: Path,
     raw_data_dir: Path,
     out: Path,
     taxonomy: Path,
     resume_from: Path | None,
-    epochs_general: int,
-    epochs_domain: int,
+    epochs: int,
     batch_size: int,
     grad_accum_steps: int,
     lr_backbone: float,
     lr_head: float,
+    warmup_frac: float,
+    weight_decay: float,
     num_workers: int,
 ) -> None:
     out.mkdir(parents=True, exist_ok=True)
@@ -185,128 +280,62 @@ def main(
 
     tax = json.loads(taxonomy.read_text())
     n_classes = len(tax["canonical"])
+    canonical = tax["canonical"]
     log.info("Taxonomy: %d canonical classes", n_classes)
 
     train_paths, train_labels, train_sources = load_manifest(manifest / "train.csv")
     val_paths, val_labels, val_sources = load_manifest(manifest / "val.csv")
     log.info("Train: %d  Val: %d", len(train_paths), len(val_paths))
 
-    # ----- Build model ----------
+    # ----- Build model -----
     model = DINOv2WithHead(n_classes).to(dev)
     if resume_from is not None:
-        probe_ckpt = torch.load(resume_from / "best_head.pt", map_location=dev)
-        log.info("Initializing head from %s (val_top1 was %.3f at probe stage)",
-                 resume_from, _read_metric(resume_from, "best_val_top1"))
+        probe_ckpt = torch.load(resume_from / "best_head.pt", map_location=dev, weights_only=False)
+        log.info("Initializing head from probe at %s", resume_from)
         model.head.load_state_dict(probe_ckpt["state_dict"])
 
-    # ----- Optimizer w/ differential LR ----------
-    head_params = list(model.head.parameters())
-    head_ids = {id(p) for p in head_params}
-    backbone_params = [p for p in model.parameters() if id(p) not in head_ids]
-    optimizer = optim.AdamW(
-        [
-            {"params": backbone_params, "lr": lr_backbone},
-            {"params": head_params, "lr": lr_head},
-        ],
-        weight_decay=0.01,
-    )
+    # ----- Optimizer with LLRD param groups -----
+    param_groups = _llrd_param_groups(model, lr_backbone, lr_head, decay=LLRD_FACTOR)
+    optimizer = optim.AdamW(param_groups, weight_decay=weight_decay)
+    log.info("Built %d AdamW param groups; smallest LR=%.2e, largest LR=%.2e",
+             len(param_groups),
+             min(g["lr"] for g in param_groups),
+             max(g["lr"] for g in param_groups))
 
-    # ----- Loss: class-weighted cross-entropy ----------
-    weights = class_weights(train_labels, n_classes, dev)
-    loss_fn = nn.CrossEntropyLoss(weight=weights)
+    # ----- Loss with capped weights + label smoothing -----
+    weights = _capped_class_weights(train_labels, n_classes, dev, cap=CLASS_WEIGHT_CAP)
+    log.info("Class weights: min=%.3f median=%.3f max=%.3f (cap=%.1f)",
+             weights.min().item(), weights.median().item(), weights.max().item(),
+             CLASS_WEIGHT_CAP)
+    loss_fn = nn.CrossEntropyLoss(weight=weights, label_smoothing=LABEL_SMOOTHING)
 
-    # ----- Val loader (used between every stage / epoch) ----------
+    # ----- Train + val loaders -----
+    train_ds = ManifestImageDataset(raw_data_dir, train_paths, train_labels, _train_transform())
     val_ds = ManifestImageDataset(raw_data_dir, val_paths, val_labels, _val_transform())
-    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False,
-                            num_workers=num_workers, pin_memory=True)
-
-    history: list[dict] = []
-    best_val_top1 = 0.0
-
-    # ----- Stage 1: GENERAL ----------
-    general_idx = [i for i, s in enumerate(train_sources)
-                   if s in ("gpiosenka", "nabirds", "inat21birds")]
-    log.info("=== STAGE 1: general (n=%d, %d epochs) ===", len(general_idx), epochs_general)
-    if general_idx:
-        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs_general)
-        best_val_top1 = _run_stage(
-            stage="general", train_idx=general_idx,
-            model=model, optimizer=optimizer, scheduler=scheduler, loss_fn=loss_fn,
-            train_paths=train_paths, train_labels=train_labels,
-            raw_data_dir=raw_data_dir, val_loader=val_loader, val_sources=val_sources,
-            epochs=epochs_general, batch_size=batch_size, grad_accum_steps=grad_accum_steps,
-            num_workers=num_workers, dev=dev, out=out, tax=tax,
-            history=history, best_val_top1=best_val_top1,
-        )
-
-    # ----- Stage 2: DOMAIN (yard only) ----------
-    domain_idx = [i for i, s in enumerate(train_sources) if s == "yard"]
-    if domain_idx and epochs_domain > 0:
-        log.info("=== STAGE 2: domain (yard n=%d, %d epochs) ===", len(domain_idx), epochs_domain)
-        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs_domain)
-        best_val_top1 = _run_stage(
-            stage="domain", train_idx=domain_idx,
-            model=model, optimizer=optimizer, scheduler=scheduler, loss_fn=loss_fn,
-            train_paths=train_paths, train_labels=train_labels,
-            raw_data_dir=raw_data_dir, val_loader=val_loader, val_sources=val_sources,
-            epochs=epochs_domain, batch_size=batch_size, grad_accum_steps=grad_accum_steps,
-            num_workers=num_workers, dev=dev, out=out, tax=tax,
-            history=history, best_val_top1=best_val_top1,
-        )
-    elif not domain_idx:
-        log.warning("No yard data in train manifest — skipping domain stage. "
-                    "Did you run `python -m data.download --datasets yard`?")
-
-    # ----- Final metrics dump ----------
-    (out / "history.json").write_text(json.dumps(history, indent=2))
-    log.info("Done. Best val_top1=%.3f  → %s", best_val_top1, out)
-
-
-def _read_metric(run_dir: Path, key: str) -> float:
-    p = run_dir / "metrics.json"
-    if not p.exists():
-        return float("nan")
-    try:
-        return float(json.loads(p.read_text()).get(key, float("nan")))
-    except (ValueError, json.JSONDecodeError):
-        return float("nan")
-
-
-def _run_stage(
-    *, stage: str,
-    train_idx: list[int],
-    model: DINOv2WithHead,
-    optimizer: optim.Optimizer,
-    scheduler,
-    loss_fn,
-    train_paths: list[str],
-    train_labels: list[int],
-    raw_data_dir: Path,
-    val_loader: DataLoader,
-    val_sources: list[str],
-    epochs: int,
-    batch_size: int,
-    grad_accum_steps: int,
-    num_workers: int,
-    dev: torch.device,
-    out: Path,
-    tax: dict,
-    history: list[dict],
-    best_val_top1: float,
-) -> float:
-    """Run one training stage. Returns updated best_val_top1."""
-    paths = [train_paths[i] for i in train_idx]
-    labels = [train_labels[i] for i in train_idx]
-    train_ds = ManifestImageDataset(raw_data_dir, paths, labels, _train_transform())
     train_loader = DataLoader(
         train_ds, batch_size=batch_size, shuffle=True,
         num_workers=num_workers, pin_memory=True, drop_last=True,
+        prefetch_factor=4,
     )
-    log.info("[%s] class counts (top 10): %s",
-             stage, Counter(labels).most_common(10))
+    val_loader = DataLoader(
+        val_ds, batch_size=batch_size, shuffle=False,
+        num_workers=num_workers, pin_memory=True,
+    )
+    log.info("Top-10 train classes by count: %s",
+             [(canonical[c], n) for c, n in Counter(train_labels).most_common(10)])
 
+    # ----- Scheduler: linear warmup → cosine -----
+    steps_per_epoch = len(train_loader) // grad_accum_steps
+    total_steps = steps_per_epoch * epochs
+    warmup_steps = max(100, int(warmup_frac * total_steps))
+    log.info("Total optimizer steps: %d  Warmup: %d (%.0f%%)",
+             total_steps, warmup_steps, 100 * warmup_steps / max(total_steps, 1))
+    scheduler = _WarmupCosineLR(optimizer, warmup_steps=warmup_steps, total_steps=total_steps)
+
+    # ----- Train loop -----
     use_amp = dev.type == "cuda"
-    autocast_dtype = torch.bfloat16
+    history: list[dict] = []
+    best_val_top1 = 0.0
 
     for epoch in range(1, epochs + 1):
         model.train()
@@ -314,11 +343,11 @@ def _run_stage(
         loss_acc = 0.0
         steps = 0
         optimizer.zero_grad(set_to_none=True)
-        for step, (imgs, lbls) in enumerate(tqdm(train_loader, desc=f"[{stage}] epoch {epoch}")):
+        for step, (imgs, lbls) in enumerate(tqdm(train_loader, desc=f"epoch {epoch}/{epochs}")):
             imgs = imgs.to(dev, non_blocking=True)
             lbls = lbls.to(dev, non_blocking=True)
             if use_amp:
-                with torch.autocast(device_type="cuda", dtype=autocast_dtype):
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                     logits = model(imgs)
                     loss = loss_fn(logits, lbls) / grad_accum_steps
             else:
@@ -327,25 +356,28 @@ def _run_stage(
             loss.backward()
             if (step + 1) % grad_accum_steps == 0:
                 optimizer.step()
+                scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
             loss_acc += float(loss.item()) * grad_accum_steps
             steps += 1
-        scheduler.step()
         train_loss = loss_acc / max(steps, 1)
 
         # Eval
         val_metrics = _evaluate(model, val_loader, val_sources, dev)
         elapsed = time.time() - t0
-        log.info("[%s] epoch %d/%d  train_loss=%.3f  val_top1=%.3f  val_top5=%.3f  %.1fs",
-                 stage, epoch, epochs, train_loss,
-                 val_metrics["top1"], val_metrics["top5"], elapsed)
+        current_lr_head = optimizer.param_groups[0]["lr"]
+        log.info("epoch %d/%d  train_loss=%.3f  val_top1=%.3f  val_top5=%.3f  "
+                 "lr_head=%.2e  %.0fs",
+                 epoch, epochs, train_loss,
+                 val_metrics["top1"], val_metrics["top5"], current_lr_head, elapsed)
         for src, acc in sorted(val_metrics["per_source_top1"].items()):
             log.info("    per-source %-12s val_top1: %.3f", src, acc)
 
         history.append({
-            "stage": stage, "epoch": epoch, "train_loss": train_loss,
+            "epoch": epoch, "train_loss": train_loss,
             "val_top1": val_metrics["top1"], "val_top5": val_metrics["top5"],
             "per_source_val_top1": val_metrics["per_source_top1"],
+            "lr_head": current_lr_head,
         })
 
         if val_metrics["top1"] > best_val_top1:
@@ -353,20 +385,20 @@ def _run_stage(
             _save_hf_format(model, out, tax)
             (out / "metrics.json").write_text(json.dumps({
                 "best_val_top1": best_val_top1,
-                "best_stage": stage,
                 "best_epoch": epoch,
+                "best_val_top5": val_metrics["top5"],
+                "best_per_source_val_top1": val_metrics["per_source_top1"],
             }, indent=2))
             log.info("    ↑ saved best (val_top1=%.3f) to %s", best_val_top1, out)
-    return best_val_top1
+
+    (out / "history.json").write_text(json.dumps(history, indent=2))
+    log.info("Done. Best val_top1=%.3f  → %s", best_val_top1, out)
 
 
 def _save_hf_format(model: DINOv2WithHead, out: Path, tax: dict) -> None:
-    """Save backbone + head as a single HF-compatible classifier directory
-    so scripts/publish.py can hand it directly to upload_folder."""
-    # The DINOv2 image classification model in transformers wraps the
-    # backbone+head exactly as we've assembled it. We export by writing
-    # a state_dict directly + the config; the publish script repackages
-    # it into a proper AutoModelForImageClassification on the destination.
+    """Save backbone + head as a single raw checkpoint. The publish
+    script (scripts/publish.py) repackages this into an HF
+    Dinov2ForImageClassification directory."""
     torch.save({
         "backbone_state": model.backbone.state_dict(),
         "head_state": model.head.state_dict(),
