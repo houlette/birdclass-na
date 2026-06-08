@@ -112,7 +112,16 @@ class _ManifestImageDataset(Dataset):
         return len(self.paths)
 
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, int]:
-        img = Image.open(self.raw_data_dir / self.paths[idx]).convert("RGB")
+        # Skip missing / unreadable images gracefully — return a black frame
+        # rather than crashing. Same fallback used by train/finetune.py.
+        # A small fraction of images get this treatment; for accuracy
+        # numbers this is a worst-case "always wrong" sample.
+        path = self.raw_data_dir / self.paths[idx]
+        try:
+            img = Image.open(path).convert("RGB")
+        except (OSError, Image.UnidentifiedImageError, FileNotFoundError):
+            log.warning("Unreadable / missing image %s — black-frame fallback", path)
+            img = Image.new("RGB", (224, 224))
         return self.transform(img), self.labels[idx]
 
 
