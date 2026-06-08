@@ -27,13 +27,13 @@ LOCAL_REPO="$(cd "$(dirname "$0")/.." && pwd)"
 RSYNC_RSH="ssh -p $REMOTE_PORT"
 
 echo "Pushing small datasets to $REMOTE_HOST:$REMOTE_REPO/raw_data/ …"
-RSYNC_RSH="$RSYNC_RSH" rsync -a --info=progress2 \
+RSYNC_RSH="$RSYNC_RSH" rsync -a --progress \
     "$LOCAL_REPO/raw_data/gpiosenka/" \
     "$REMOTE_HOST:$REMOTE_REPO/raw_data/gpiosenka/"
-RSYNC_RSH="$RSYNC_RSH" rsync -a --info=progress2 \
+RSYNC_RSH="$RSYNC_RSH" rsync -a --progress \
     "$LOCAL_REPO/raw_data/nabirds/" \
     "$REMOTE_HOST:$REMOTE_REPO/raw_data/nabirds/"
-RSYNC_RSH="$RSYNC_RSH" rsync -a --info=progress2 \
+RSYNC_RSH="$RSYNC_RSH" rsync -a --progress \
     "$LOCAL_REPO/raw_data/yard/" \
     "$REMOTE_HOST:$REMOTE_REPO/raw_data/yard/"
 
@@ -48,7 +48,7 @@ if [ "$PULL_BACK" = "--pull-back" ]; then
     echo ""
     echo "Waiting for runs/ on the remote. Press Ctrl-C if you want to pull back later."
     read -p "Press Enter when training has finished to pull runs/ back … "
-    RSYNC_RSH="$RSYNC_RSH" rsync -a --info=progress2 \
+    RSYNC_RSH="$RSYNC_RSH" rsync -a --progress \
         "$REMOTE_HOST:$REMOTE_REPO/runs/" \
         "$LOCAL_REPO/runs/"
     echo "Pulled. Don't forget to destroy the vast.ai instance."
