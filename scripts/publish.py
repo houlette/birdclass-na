@@ -75,9 +75,9 @@ yard dataset.
 
 - North American backyard bird identification, **especially** under
   feeder-camera conditions (partial occlusion, motion blur, leaf
-  clutter, low-light) — the domain stage of training adapted
-  specifically to these conditions using real labeled crops from a
-  production deployment.
+  clutter, low-light) — the training mix includes ~2,000 user-labeled
+  crops from a real feeder-camera deployment alongside the public
+  datasets.
 - Fine-grained discrimination of common NA confusables (Mourning Dove
   vs Rock Pigeon, Cooper's Hawk vs Sharp-shinned Hawk).
 
@@ -199,8 +199,32 @@ def _repackage_to_hf(model_dir: Path, out_dir: Path, canonical: list[str]) -> No
     )
     # Replace backbone weights with our fine-tuned ones.
     model.dinov2.load_state_dict(ckpt["backbone_state"])
-    # The HF wrapper uses `.classifier` for the linear head.
-    model.classifier.load_state_dict(ckpt["head_state"])
+
+    # Architectural detail: HF's Dinov2ForImageClassification concatenates
+    # CLS + mean(patch_tokens) → 1536-dim, then classifier is Linear(1536, N).
+    # Our training used CLS-only (Linear(768, N)). To make our weights
+    # usable in the standard HF wrapper, we map our (N, 768) weight
+    # matrix into the first 768 columns of HF's (N, 1536) classifier and
+    # zero the remaining 768. The forward computation then becomes:
+    #
+    #   logits = W[:, :768] @ cls + W[:, 768:] @ patch_mean + b
+    #          = our_weight @ cls + 0 @ patch_mean + our_bias
+    #          = our_weight @ cls + our_bias
+    #
+    # which is exactly what we trained. No accuracy loss; standard HF
+    # AutoModelForImageClassification API works out of the box for users.
+    our_w = ckpt["head_state"]["weight"]   # (N, 768)
+    our_b = ckpt["head_state"]["bias"]     # (N,)
+    hf_dim = model.classifier.in_features  # 1536 expected
+    assert hf_dim == 2 * our_w.shape[1], (
+        f"unexpected HF classifier input dim {hf_dim} vs 2x our_w.shape[1] "
+        f"({our_w.shape[1]}); HF Dinov2 wrapper may have changed its forward")
+    new_w = torch.zeros(our_w.shape[0], hf_dim, dtype=our_w.dtype)
+    new_w[:, : our_w.shape[1]] = our_w
+    model.classifier.load_state_dict({"weight": new_w, "bias": our_b})
+    log.info("Zero-padded head weights: (%d, %d) → (%d, %d) "
+             "(CLS-only training compatible with HF CLS+patch-mean classifier)",
+             our_w.shape[0], our_w.shape[1], our_w.shape[0], hf_dim)
 
     out_dir.mkdir(parents=True, exist_ok=True)
     model.save_pretrained(out_dir)
