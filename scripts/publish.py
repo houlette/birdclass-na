@@ -131,10 +131,16 @@ print(model.config.id2label[top1])
 ## Limitations and honest claims
 
 This model is **best-in-class among open-source bird classifiers for
-NA backyard / camera-trap use** — it is **not** absolute SOTA on bird
-classification benchmarks. Cornell's Merlin Bird ID app and iNaturalist's
-internal classifier are both trained on orders of magnitude more data
-and remain stronger on most common-species, clean-photo scenarios.
+NA backyard / camera-trap use** — see the benchmark table above for
+the head-to-head numbers vs the strongest alternatives we found
+(denisjooo's EfficientNet and birder-project's Hiera-DINOv2-iNat21).
+We win overall (+3.3 pp over birder, +69 pp over denisjooo) and by
+~40 pp on real yard / camera-trap conditions.
+
+It is **not** absolute SOTA on bird classification benchmarks. Cornell's
+Merlin Bird ID app and iNaturalist's internal classifier are both
+trained on orders of magnitude more data and remain stronger on most
+common-species, clean-photo scenarios.
 
 Use this model when:
 - You need a local-running, fine-tunable bird classifier.
